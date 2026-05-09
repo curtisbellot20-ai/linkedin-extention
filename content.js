@@ -1,151 +1,104 @@
-// content.js — Isolated world, runs on linkedin.com
+// content.js — Runs on linkedin.com
 (function () {
   'use strict';
 
-  const knownPostUrls = new Set();
-  let activeOverlay   = null;
-  let lastUrl         = location.href;
+  const LOG = (...a) => console.log('[LinkedIn AI]', ...a);
+  LOG('Script loaded on', location.href);
 
-  const LOG = (...args) => console.log('[LinkedIn AI]', ...args);
+  // ─── Visual proof-of-life indicator ────────────────────────────────────────────
+  // A small dot in the corner proves the script is running
+  const dot = document.createElement('div');
+  dot.id = 'lai-dot';
+  dot.title = 'LinkedIn AI Assistant active';
+  dot.style.cssText = 'position:fixed;bottom:12px;left:12px;width:12px;height:12px;border-radius:50%;background:#0077B5;z-index:999999;box-shadow:0 0 0 2px #fff;';
+  document.body.appendChild(dot);
 
-  // ─── Init ──────────────────────────────────────────────────────────────
+  // ─── URL polling (most reliable SPA navigation detection) ─────────────────
 
-  function init() {
-    LOG('Loaded on', location.pathname);
+  let lastUrl       = location.href;
+  let overlayShown  = false;
+  let pendingRequestId = null;
 
-    // METHOD 1: Watch for navigation to a post page (most reliable)
-    // When user clicks any notification and lands on a post, we trigger automatically
-    watchUrlChanges();
+  // Check if already on a post page when script first loads
+  if (isPostUrl(location.href)) {
+    LOG('Already on post page, triggering in 2s');
+    setTimeout(() => onPostPage(location.href), 2000);
+  }
 
-    // If already on a post page when script loads
+  // Poll every 500ms for URL changes (LinkedIn SPA)
+  setInterval(() => {
+    if (location.href === lastUrl) return;
+    lastUrl = location.href;
+    LOG('URL changed to', location.href);
+    overlayShown = false; // reset on navigation
     if (isPostUrl(location.href)) {
-      LOG('Already on a post page — triggering in 2s');
-      setTimeout(() => onArrivedAtPost(location.href), 2000);
+      LOG('Post page detected! Triggering in 2s...');
+      dot.style.background = '#ff9900'; // turns orange while processing
+      setTimeout(() => onPostPage(location.href), 2000);
     }
+  }, 500);
 
-    // METHOD 2: Intercept LinkedIn's fetch API (catches notifications before user clicks)
-    window.addEventListener('message', onPageMessage);
+  // ─── When we land on a post page ──────────────────────────────────────────
 
-    // METHOD 3: DOM scan on notifications page as last fallback
-    if (location.pathname.startsWith('/notifications')) {
-      startDomScanner();
-    } else {
-      watchBellBadge();
-    }
-  }
-
-  // ─── METHOD 1: URL navigation watcher ─────────────────────────────────────────
-
-  function watchUrlChanges() {
-    // LinkedIn is a SPA — watch for URL changes via MutationObserver on the title
-    // (title always changes on navigation, even without a page reload)
-    new MutationObserver(() => {
-      if (location.href !== lastUrl) {
-        const prev = lastUrl;
-        lastUrl = location.href;
-        LOG('URL changed to', location.href);
-        if (isPostUrl(location.href)) {
-          LOG('Navigated to post page! Triggering engagement flow in 2s');
-          setTimeout(() => onArrivedAtPost(location.href), 2000);
-        }
-      }
-    }).observe(document.querySelector('title') || document.head, {
-      subtree: true, characterData: true, childList: true,
-    });
-  }
-
-  function onArrivedAtPost(postUrl) {
-    const key = postUrl.split('?')[0];
-    if (knownPostUrls.has(key)) return;
-    knownPostUrls.add(key);
-
+  function onPostPage(url) {
+    if (overlayShown) return;
     const content = getPostContent();
-    LOG('Post content read:', content.substring(0, 100));
+    LOG('Post content:', content.substring(0, 120));
+
+    // Show overlay immediately with "Generating..." while we wait for AI
+    showOverlay('Generating AI comment…', '__pending__');
 
     chrome.runtime.sendMessage({
       type:      'NEW_POST_NOTIFICATION',
-      postUrl:   postUrl,
+      postUrl:   url,
       notifText: content,
-      notifId:   key,
+      notifId:   url.split('?')[0],
+    }, (response) => {
+      LOG('Background acknowledged:', response);
     });
   }
 
-  // ─── METHOD 2: API interception listener ──────────────────────────────────────
-
-  function onPageMessage(event) {
-    if (event.source !== window) return;
-    if (event.data?.source !== 'linkedin-ai-ext') return;
-    if (event.data.type !== 'NOTIF_API_DATA') return;
-    LOG('API intercept caught URLs:', event.data.urls);
-    event.data.urls.forEach((path) => {
-      const fullUrl = path.startsWith('http') ? path : 'https://www.linkedin.com' + path.replace(/\\/g, '');
-      const key = fullUrl.split('?')[0];
-      if (knownPostUrls.has(key)) return;
-      knownPostUrls.add(key);
-      chrome.runtime.sendMessage({
-        type: 'NEW_POST_NOTIFICATION', postUrl: fullUrl, notifText: '', notifId: key,
-      });
+  // Poll for the generated comment from background
+  const commentPollInterval = setInterval(() => {
+    if (!document.getElementById('lai-overlay')) return; // overlay not showing
+    chrome.runtime.sendMessage({ type: 'GET_PENDING' }, (requests) => {
+      if (chrome.runtime.lastError || !requests) return;
+      const entries = Object.values(requests);
+      if (entries.length === 0) return;
+      const req = entries[entries.length - 1]; // most recent
+      if (req.comment && req.comment !== 'Generating AI comment…') {
+        LOG('Comment ready, updating overlay:', req.comment.substring(0, 60));
+        const ta = document.getElementById('lai-text');
+        if (ta) ta.value = req.comment;
+        pendingRequestId = req.requestId;
+        dot.style.background = '#00b050'; // green = ready
+      }
     });
-  }
+  }, 1500);
 
-  // ─── METHOD 3: DOM scanner (notifications page fallback) ─────────────────────
+  // ─── Bell badge watcher (non-post pages) ────────────────────────────────
 
-  function startDomScanner() {
-    LOG('Starting DOM scanner on notifications page');
-    scanDom();
-    setInterval(scanDom, 3000);
-    const obs = new MutationObserver(scanDom);
-    const attach = () => obs.observe(document.querySelector('[role="main"]') || document.body, { childList: true, subtree: true });
-    attach(); setTimeout(attach, 2000);
-  }
+  let bellWasShowing = false;
+  setInterval(() => {
+    const badge = document.querySelector('.notification-badge--show');
+    if (badge && !bellWasShowing) {
+      bellWasShowing = true;
+      LOG('Bell badge detected — opening scan tab');
+      chrome.runtime.sendMessage({ type: 'BELL_BADGE_CHANGED', count: 1 });
+    } else if (!badge) { bellWasShowing = false; }
+  }, 4000);
 
-  function scanDom() {
-    const root  = document.querySelector('[role="main"]') || document.body;
-    const links = [...root.querySelectorAll('a[href]')];
-    const posts = links.filter(a => isPostUrl(a.href));
-    if (posts.length) LOG('DOM found', posts.length, 'post links');
-    else LOG('DOM scan: sample hrefs =', links.slice(0, 6).map(a => a.href));
-    posts.forEach(a => {
-      const card = a.closest('[role="listitem"],[role="article"],li,[data-urn]') || a.parentElement;
-      const text = (card || a).innerText?.trim() || '';
-      if (/daily rundown|newsletter|promoted/i.test(text)) return;
-      const key = a.href.split('?')[0];
-      if (knownPostUrls.has(key)) return;
-      knownPostUrls.add(key);
-      chrome.runtime.sendMessage({ type: 'NEW_POST_NOTIFICATION', postUrl: a.href, notifText: text.substring(0, 800), notifId: key });
-    });
-  }
-
-  // ─── Bell badge watcher ────────────────────────────────────────────────────
-
-  function watchBellBadge() {
-    let wasShowing = false;
-    function check() {
-      const badge = document.querySelector('.notification-badge--show');
-      if (badge && !wasShowing) {
-        wasShowing = true;
-        LOG('Bell badge appeared — opening background scan tab');
-        chrome.runtime.sendMessage({ type: 'BELL_BADGE_CHANGED', count: 1 });
-      } else if (!badge) { wasShowing = false; }
-    }
-    const nav = document.querySelector('.global-nav__primary-link-notif,[role="navigation"],header') || document.body;
-    new MutationObserver(check).observe(nav, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
-    setInterval(check, 5000);
-    check();
-  }
-
-  // ─── Post content reader ──────────────────────────────────────────────────────
+  // ─── Post content reader ───────────────────────────────────────────────────
 
   function getPostContent() {
     const main = document.querySelector('[role="main"]');
     if (!main) return document.body.innerText.substring(0, 2000);
     const spans = [...main.querySelectorAll('span[dir]')]
       .map(s => s.innerText.trim()).filter(t => t.length > 20);
-    if (spans.length) return spans.slice(0, 6).join(' ').substring(0, 2000);
-    return main.innerText.substring(0, 2000);
+    return (spans.length ? spans.slice(0, 6).join(' ') : main.innerText).substring(0, 2000);
   }
 
-  // ─── Like ───────────────────────────────────────────────────────────────────
+  // ─── Like action ────────────────────────────────────────────────────────────────
 
   async function doLike() {
     const btn = document.querySelector('button[aria-label*="Like"][aria-pressed="false"],button[aria-label="Like"]');
@@ -153,28 +106,36 @@
     return false;
   }
 
-  // ─── Comment ───────────────────────────────────────────────────────────────────
+  // ─── Comment action ─────────────────────────────────────────────────────────────
 
   async function doComment(text) {
     const openBtn = document.querySelector('button[aria-label*="comment" i]');
     if (openBtn) { openBtn.click(); await sleep(1000 + rand(500)); }
     const editor = document.querySelector('[contenteditable="true"][aria-label*="comment" i],[contenteditable="true"][aria-placeholder*="comment" i],.ql-editor[contenteditable="true"],[contenteditable="true"]');
     if (!editor) return false;
-    editor.focus(); await sleep(200 + rand(200));
+    editor.focus(); await sleep(200);
     document.execCommand('selectAll', false, null);
     document.execCommand('delete', false, null);
-    for (const ch of text) { document.execCommand('insertText', false, ch); await sleep(30 + rand(70)); }
-    await sleep(600 + rand(600));
+    for (const ch of text) { document.execCommand('insertText', false, ch); await sleep(35 + rand(65)); }
+    await sleep(700);
     const submit = document.querySelector('button[aria-label*="submit" i]:not([disabled]),button[type="submit"]:not([disabled])');
-    if (submit) { submit.click(); await sleep(500); return true; }
+    if (submit) { submit.click(); return true; }
     editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true, ctrlKey: true }));
     return true;
   }
 
   // ─── Overlay ────────────────────────────────────────────────────────────────────
 
-  function showOverlay({ comment, requestId }) {
-    removeOverlay();
+  function showOverlay(comment, requestId) {
+    if (overlayShown) {
+      // Just update the textarea if already shown
+      const ta = document.getElementById('lai-text');
+      if (ta) ta.value = comment;
+      return;
+    }
+    overlayShown = true;
+    pendingRequestId = requestId;
+
     const div = document.createElement('div');
     div.id = 'lai-overlay';
     div.innerHTML = `
@@ -190,35 +151,41 @@
       </div>
     `;
     document.body.appendChild(div);
-    activeOverlay = div;
+
     div.addEventListener('click', async (e) => {
       const action = e.target.closest('[data-action]')?.dataset.action;
       if (!action) return;
+      const rid = pendingRequestId;
       if (action === 'approve') {
-        const text = div.querySelector('#lai-text').value.trim();
-        if (!text) return;
-        removeOverlay();
+        const text = document.getElementById('lai-text')?.value?.trim();
+        if (!text || text === 'Generating AI comment…') return;
+        div.remove(); overlayShown = false;
+        dot.style.background = '#0077B5';
         await doLike(); await sleep(600 + rand(400)); await doComment(text);
-        chrome.runtime.sendMessage({ type: 'ENGAGEMENT_DONE', requestId });
+        chrome.runtime.sendMessage({ type: 'ENGAGEMENT_DONE', requestId: rid }).catch(() => {});
       } else {
-        removeOverlay();
-        chrome.runtime.sendMessage({ type: 'ENGAGEMENT_SKIPPED', requestId });
+        div.remove(); overlayShown = false;
+        dot.style.background = '#0077B5';
+        chrome.runtime.sendMessage({ type: 'ENGAGEMENT_SKIPPED', requestId: rid }).catch(() => {});
       }
     });
   }
 
-  function removeOverlay() { activeOverlay?.remove(); activeOverlay = null; }
-
-  // ─── Message handler ───────────────────────────────────────────────────────
+  // ─── Messages from background ───────────────────────────────────────────────
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    switch (msg.type) {
-      case 'GET_POST_CONTENT': sendResponse({ content: getPostContent() }); break;
-      case 'SHOW_OVERLAY':     showOverlay(msg); sendResponse({ ok: true }); break;
-      case 'DO_ENGAGE':
-        (async () => { await doLike(); await sleep(700 + rand(500)); await doComment(msg.comment); sendResponse({ ok: true }); })();
-        return true;
-      case 'REMOVE_OVERLAY': removeOverlay(); sendResponse({ ok: true }); break;
+    if (msg.type === 'SHOW_OVERLAY') {
+      showOverlay(msg.comment, msg.requestId);
+      pendingRequestId = msg.requestId;
+      dot.style.background = '#00b050';
+      sendResponse({ ok: true });
+    }
+    if (msg.type === 'DO_ENGAGE') {
+      (async () => {
+        await doLike(); await sleep(700 + rand(500)); await doComment(msg.comment);
+        sendResponse({ ok: true });
+      })();
+      return true;
     }
   });
 
@@ -231,7 +198,5 @@
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   function rand(n)   { return Math.floor(Math.random() * n); }
   function esc(s)    { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-
-  init();
 
 })();
