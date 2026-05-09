@@ -4,141 +4,151 @@
 
   const knownPostUrls = new Set();
   let activeOverlay   = null;
-  const isNotifPage   = window.location.pathname.startsWith('/notifications');
+  let lastUrl         = location.href;
 
   const LOG = (...args) => console.log('[LinkedIn AI]', ...args);
 
-  // ─── Init ─────────────────────────────────────────────────────────────────
+  // ─── Init ──────────────────────────────────────────────────────────────
 
   function init() {
-    LOG('Content script loaded on', window.location.pathname);
+    LOG('Loaded on', location.pathname);
 
-    // Primary method: listen for data from page_inject.js (API interception)
+    // METHOD 1: Watch for navigation to a post page (most reliable)
+    // When user clicks any notification and lands on a post, we trigger automatically
+    watchUrlChanges();
+
+    // If already on a post page when script loads
+    if (isPostUrl(location.href)) {
+      LOG('Already on a post page — triggering in 2s');
+      setTimeout(() => onArrivedAtPost(location.href), 2000);
+    }
+
+    // METHOD 2: Intercept LinkedIn's fetch API (catches notifications before user clicks)
     window.addEventListener('message', onPageMessage);
-    LOG('Listening for LinkedIn API interception messages');
 
-    // Secondary method: DOM scan as fallback (runs on notifications page)
-    if (isNotifPage) {
-      LOG('Also running DOM scanner as fallback');
+    // METHOD 3: DOM scan on notifications page as last fallback
+    if (location.pathname.startsWith('/notifications')) {
       startDomScanner();
     } else {
       watchBellBadge();
     }
   }
 
-  // ─── Primary: API interception listener ─────────────────────────────────────
+  // ─── METHOD 1: URL navigation watcher ─────────────────────────────────────────
 
-  function onPageMessage(event) {
-    if (event.source !== window) return;
-    if (event.data?.source !== 'linkedin-ai-ext') return;
-
-    if (event.data.type === 'NOTIF_API_DATA') {
-      LOG('API intercept caught notification data. URLs:', event.data.urls);
-      event.data.urls.forEach((path) => {
-        let fullUrl = path.startsWith('http') ? path : 'https://www.linkedin.com' + path;
-        fullUrl = fullUrl.replace(/\\/g, ''); // unescape any JSON backslashes
-        processNotifUrl(fullUrl, '');
-      });
-    }
-  }
-
-  // ─── Secondary: DOM scanner fallback ───────────────────────────────────────────
-
-  function startDomScanner() {
-    scanDom();
-    setInterval(scanDom, 3000);
-    const obs = new MutationObserver(scanDom);
-    const attach = () => {
-      const root = document.querySelector('[role="main"]') || document.body;
-      obs.observe(root, { childList: true, subtree: true });
-    };
-    attach();
-    setTimeout(attach, 2000);
-  }
-
-  function scanDom() {
-    const root  = document.querySelector('[role="main"]') || document.body;
-    const links = [...root.querySelectorAll('a[href]'), ...root.querySelectorAll('[data-href]')];
-    const all   = links.map(el => ({ url: el.href || el.dataset.href || '', el }));
-    const posts = all.filter(c => isPostUrl(c.url));
-
-    if (posts.length) {
-      LOG('DOM scanner found', posts.length, 'post link(s)');
-    } else {
-      LOG('DOM scanner: no post links yet. Sample hrefs:', all.slice(0, 8).map(c => c.url));
-    }
-
-    posts.forEach(({ url, el }) => {
-      const card = el.closest('[role="listitem"]') || el.closest('[role="article"]') ||
-                   el.closest('li') || el.closest('[data-urn]') || el.parentElement;
-      const text = (card || el).innerText?.trim() || '';
-      if (/daily rundown|weekly rundown|newsletter|promoted/i.test(text)) return;
-      processNotifUrl(url, text);
+  function watchUrlChanges() {
+    // LinkedIn is a SPA — watch for URL changes via MutationObserver on the title
+    // (title always changes on navigation, even without a page reload)
+    new MutationObserver(() => {
+      if (location.href !== lastUrl) {
+        const prev = lastUrl;
+        lastUrl = location.href;
+        LOG('URL changed to', location.href);
+        if (isPostUrl(location.href)) {
+          LOG('Navigated to post page! Triggering engagement flow in 2s');
+          setTimeout(() => onArrivedAtPost(location.href), 2000);
+        }
+      }
+    }).observe(document.querySelector('title') || document.head, {
+      subtree: true, characterData: true, childList: true,
     });
   }
 
-  // ─── Shared: process a discovered post URL ─────────────────────────────────────
-
-  function processNotifUrl(url, notifText) {
-    const key = url.split('?')[0];
+  function onArrivedAtPost(postUrl) {
+    const key = postUrl.split('?')[0];
     if (knownPostUrls.has(key)) return;
     knownPostUrls.add(key);
-    LOG('New post notification → background:', key);
+
+    const content = getPostContent();
+    LOG('Post content read:', content.substring(0, 100));
+
     chrome.runtime.sendMessage({
       type:      'NEW_POST_NOTIFICATION',
-      postUrl:   url,
-      notifText: notifText.substring(0, 800),
+      postUrl:   postUrl,
+      notifText: content,
       notifId:   key,
     });
   }
 
-  function isPostUrl(url) {
-    if (!url) return false;
-    return url.includes('/posts/') || url.includes('ugcPost') ||
-           url.includes('/feed/update/') || url.includes('urn%3Ali%3Aactivity') ||
-           url.includes('urn:li:activity');
+  // ─── METHOD 2: API interception listener ──────────────────────────────────────
+
+  function onPageMessage(event) {
+    if (event.source !== window) return;
+    if (event.data?.source !== 'linkedin-ai-ext') return;
+    if (event.data.type !== 'NOTIF_API_DATA') return;
+    LOG('API intercept caught URLs:', event.data.urls);
+    event.data.urls.forEach((path) => {
+      const fullUrl = path.startsWith('http') ? path : 'https://www.linkedin.com' + path.replace(/\\/g, '');
+      const key = fullUrl.split('?')[0];
+      if (knownPostUrls.has(key)) return;
+      knownPostUrls.add(key);
+      chrome.runtime.sendMessage({
+        type: 'NEW_POST_NOTIFICATION', postUrl: fullUrl, notifText: '', notifId: key,
+      });
+    });
   }
 
-  // ─── Bell badge watcher (non-notification pages) ───────────────────────────
+  // ─── METHOD 3: DOM scanner (notifications page fallback) ─────────────────────
+
+  function startDomScanner() {
+    LOG('Starting DOM scanner on notifications page');
+    scanDom();
+    setInterval(scanDom, 3000);
+    const obs = new MutationObserver(scanDom);
+    const attach = () => obs.observe(document.querySelector('[role="main"]') || document.body, { childList: true, subtree: true });
+    attach(); setTimeout(attach, 2000);
+  }
+
+  function scanDom() {
+    const root  = document.querySelector('[role="main"]') || document.body;
+    const links = [...root.querySelectorAll('a[href]')];
+    const posts = links.filter(a => isPostUrl(a.href));
+    if (posts.length) LOG('DOM found', posts.length, 'post links');
+    else LOG('DOM scan: sample hrefs =', links.slice(0, 6).map(a => a.href));
+    posts.forEach(a => {
+      const card = a.closest('[role="listitem"],[role="article"],li,[data-urn]') || a.parentElement;
+      const text = (card || a).innerText?.trim() || '';
+      if (/daily rundown|newsletter|promoted/i.test(text)) return;
+      const key = a.href.split('?')[0];
+      if (knownPostUrls.has(key)) return;
+      knownPostUrls.add(key);
+      chrome.runtime.sendMessage({ type: 'NEW_POST_NOTIFICATION', postUrl: a.href, notifText: text.substring(0, 800), notifId: key });
+    });
+  }
+
+  // ─── Bell badge watcher ────────────────────────────────────────────────────
 
   function watchBellBadge() {
     let wasShowing = false;
     function check() {
-      // .notification-badge--show confirmed from DOM inspection
       const badge = document.querySelector('.notification-badge--show');
       if (badge && !wasShowing) {
         wasShowing = true;
-        LOG('Bell badge appeared — opening background scan');
+        LOG('Bell badge appeared — opening background scan tab');
         chrome.runtime.sendMessage({ type: 'BELL_BADGE_CHANGED', count: 1 });
-      } else if (!badge) {
-        wasShowing = false;
-      }
+      } else if (!badge) { wasShowing = false; }
     }
-    const nav = document.querySelector('.global-nav__primary-link-notif, [role="navigation"], header') || document.body;
+    const nav = document.querySelector('.global-nav__primary-link-notif,[role="navigation"],header') || document.body;
     new MutationObserver(check).observe(nav, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
     setInterval(check, 5000);
     check();
   }
 
-  // ─── Post content reader ───────────────────────────────────────────────────────
+  // ─── Post content reader ──────────────────────────────────────────────────────
 
   function getPostContent() {
     const main = document.querySelector('[role="main"]');
-    if (main) {
-      const spans = [...main.querySelectorAll('span[dir="ltr"],span[dir="rtl"]')]
-        .map(s => s.innerText.trim()).filter(t => t.length > 30);
-      if (spans.length) return spans.slice(0, 5).join(' ').substring(0, 2000);
-      return main.innerText.substring(0, 2000);
-    }
-    return '';
+    if (!main) return document.body.innerText.substring(0, 2000);
+    const spans = [...main.querySelectorAll('span[dir]')]
+      .map(s => s.innerText.trim()).filter(t => t.length > 20);
+    if (spans.length) return spans.slice(0, 6).join(' ').substring(0, 2000);
+    return main.innerText.substring(0, 2000);
   }
 
   // ─── Like ───────────────────────────────────────────────────────────────────
 
   async function doLike() {
-    const btn = document.querySelector(
-      'button[aria-label*="Like"][aria-pressed="false"], button[aria-label="Like"]'
-    );
+    const btn = document.querySelector('button[aria-label*="Like"][aria-pressed="false"],button[aria-label="Like"]');
     if (btn) { btn.click(); await sleep(400 + rand(300)); return true; }
     return false;
   }
@@ -148,27 +158,14 @@
   async function doComment(text) {
     const openBtn = document.querySelector('button[aria-label*="comment" i]');
     if (openBtn) { openBtn.click(); await sleep(1000 + rand(500)); }
-
-    const editor = document.querySelector(
-      '[contenteditable="true"][aria-label*="comment" i], ' +
-      '[contenteditable="true"][aria-placeholder*="comment" i], ' +
-      '.ql-editor[contenteditable="true"], [contenteditable="true"]'
-    );
+    const editor = document.querySelector('[contenteditable="true"][aria-label*="comment" i],[contenteditable="true"][aria-placeholder*="comment" i],.ql-editor[contenteditable="true"],[contenteditable="true"]');
     if (!editor) return false;
-
-    editor.focus();
-    await sleep(200 + rand(200));
+    editor.focus(); await sleep(200 + rand(200));
     document.execCommand('selectAll', false, null);
     document.execCommand('delete', false, null);
-    for (const ch of text) {
-      document.execCommand('insertText', false, ch);
-      await sleep(30 + rand(70));
-    }
+    for (const ch of text) { document.execCommand('insertText', false, ch); await sleep(30 + rand(70)); }
     await sleep(600 + rand(600));
-
-    const submit = document.querySelector(
-      'button[aria-label*="submit" i]:not([disabled]), button[type="submit"]:not([disabled])'
-    );
+    const submit = document.querySelector('button[aria-label*="submit" i]:not([disabled]),button[type="submit"]:not([disabled])');
     if (submit) { submit.click(); await sleep(500); return true; }
     editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true, ctrlKey: true }));
     return true;
@@ -201,9 +198,7 @@
         const text = div.querySelector('#lai-text').value.trim();
         if (!text) return;
         removeOverlay();
-        await doLike();
-        await sleep(600 + rand(400));
-        await doComment(text);
+        await doLike(); await sleep(600 + rand(400)); await doComment(text);
         chrome.runtime.sendMessage({ type: 'ENGAGEMENT_DONE', requestId });
       } else {
         removeOverlay();
@@ -221,12 +216,7 @@
       case 'GET_POST_CONTENT': sendResponse({ content: getPostContent() }); break;
       case 'SHOW_OVERLAY':     showOverlay(msg); sendResponse({ ok: true }); break;
       case 'DO_ENGAGE':
-        (async () => {
-          await doLike();
-          await sleep(700 + rand(500));
-          await doComment(msg.comment);
-          sendResponse({ ok: true });
-        })();
+        (async () => { await doLike(); await sleep(700 + rand(500)); await doComment(msg.comment); sendResponse({ ok: true }); })();
         return true;
       case 'REMOVE_OVERLAY': removeOverlay(); sendResponse({ ok: true }); break;
     }
@@ -234,11 +224,13 @@
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
 
+  function isPostUrl(url) {
+    return url && (url.includes('/posts/') || url.includes('ugcPost') ||
+                   url.includes('/feed/update/') || url.includes('urn:li:activity'));
+  }
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   function rand(n)   { return Math.floor(Math.random() * n); }
-  function esc(s) {
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-  }
+  function esc(s)    { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
   init();
 
