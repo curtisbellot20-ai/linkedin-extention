@@ -2,26 +2,79 @@
 (function () {
   'use strict';
 
-  const knownNotifIds = new Set();
-  let activeOverlay = null;
-  const isNotifPage = window.location.pathname.startsWith('/notifications');
+  // Use post URL (no query string) as the dedup key — more reliable than DOM ids
+  const knownPostUrls = new Set();
+  let activeOverlay   = null;
+  const isNotifPage   = window.location.pathname.startsWith('/notifications');
 
   // ─── Entry point ──────────────────────────────────────────────────────────
 
   function init() {
     if (isNotifPage) {
-      // On the notifications page: scan immediately and watch for new items
-      waitForEl('main, [role="main"]', (el) => {
-        scanNotifications();
-        new MutationObserver(scanNotifications).observe(el, { childList: true, subtree: true });
-      });
+      startNotificationScanning();
     } else {
-      // On any other LinkedIn page: watch the bell badge count
       watchBellBadge();
     }
   }
 
-  // ─── Bell badge watcher (all LinkedIn pages) ──────────────────────────────
+  // ─── Notification page scanning ──────────────────────────────────────────────
+
+  function startNotificationScanning() {
+    // Scan immediately
+    scanNotifications();
+
+    // Poll every 2 s — LinkedIn is a SPA; DOM changes can be missed
+    setInterval(scanNotifications, 2000);
+
+    // Also watch the DOM for dynamic content
+    const obs = new MutationObserver(scanNotifications);
+    function attachObs() {
+      const root = document.querySelector(
+        '.scaffold-finite-scroll__content, main, [role="main"], body'
+      );
+      if (root) obs.observe(root, { childList: true, subtree: true });
+    }
+    attachObs();
+    setTimeout(attachObs, 1500);
+    setTimeout(attachObs, 4000);
+  }
+
+  function scanNotifications() {
+    // Cast a wide net: find every anchor that points to a LinkedIn post
+    const links = document.querySelectorAll(
+      'a[href*="/posts/"], a[href*="ugcPost"], a[href*="/feed/update/"], a[href*="urn%3Ali%3Aactivity"]'
+    );
+
+    links.forEach((link) => {
+      const rawUrl  = link.href || '';
+      const postKey = rawUrl.split('?')[0]; // strip query params for stable key
+      if (!postKey || knownPostUrls.has(postKey)) return;
+
+      // Walk up to find the notification card
+      const card = link.closest(
+        'li, article, [data-urn], .artdeco-list__item, .nt-card, section'
+      ) || link.parentElement;
+
+      const cardText = card?.innerText?.trim() || '';
+
+      // Must look like a "posted" notification (not a share button, ad, etc.)
+      if (!/post|shared|published|article/i.test(cardText)) return;
+
+      // Skip digest / news notifications
+      if (/daily rundown|weekly rundown|newsletter|linkedin news/i.test(cardText)) return;
+
+      knownPostUrls.add(postKey);
+
+      chrome.runtime.sendMessage({
+        type:      'NEW_POST_NOTIFICATION',
+        postUrl:   rawUrl,
+        notifText: cardText.substring(0, 800),
+        notifId:   postKey,
+      });
+    });
+  }
+
+  // ─── Bell badge watcher (non-notification pages) ───────────────────────────
 
   function watchBellBadge() {
     let lastCount = 0;
@@ -30,12 +83,11 @@
       const badge = document.querySelector(
         '.notification-badge__count, .nav-item__badge-count, [data-test-notification-count]'
       );
-      const raw   = badge?.textContent?.trim().replace(/[^0-9]/g, '') || '0';
-      const count = parseInt(raw, 10);
-
+      const count = parseInt(
+        (badge?.textContent?.trim() || '0').replace(/[^0-9]/g, ''), 10
+      );
       if (count > 0 && count !== lastCount) {
         lastCount = count;
-        // Tell background: new notifications exist — open a background scan tab
         chrome.runtime.sendMessage({ type: 'BELL_BADGE_CHANGED', count });
       }
     }
@@ -48,44 +100,7 @@
     });
   }
 
-  // ─── Notification page scanner ────────────────────────────────────────────
-
-  function scanNotifications() {
-    // LinkedIn uses several class/attribute patterns — cover them all
-    const items = document.querySelectorAll(
-      '[data-urn*="urn:li:notification"], .nt-card, .notification-item, ' +
-      '.artdeco-list__item, [data-finite-scroll-hotspot-top] li'
-    );
-
-    items.forEach((item) => {
-      // Build a stable ID for deduplication
-      const urn     = item.dataset.urn || item.querySelector('[data-urn]')?.dataset.urn;
-      const notifId = urn || hashEl(item);
-      if (knownNotifIds.has(notifId)) return;
-
-      // Only care about notifications that link to a post
-      const link = item.querySelector(
-        'a[href*="/posts/"], a[href*="ugcPost"], a[href*="/feed/update/"], a[href*="activity"]'
-      );
-      if (!link) return;
-
-      // Only care about "X posted" or "X shared" style notifications
-      const text = item.innerText || '';
-      const isPostNotif = /posted|shared a post|shared an article|published/i.test(text);
-      if (!isPostNotif) return;
-
-      knownNotifIds.add(notifId);
-
-      chrome.runtime.sendMessage({
-        type:      'NEW_POST_NOTIFICATION',
-        postUrl:   link.href,
-        notifText: text.trim().substring(0, 800),
-        notifId,
-      });
-    });
-  }
-
-  // ─── Post content reader (called when on an actual post page) ────────────
+  // ─── Post content reader (called on the actual post page) ─────────────────
 
   function getPostContent() {
     const sels = [
@@ -103,7 +118,7 @@
     return document.querySelector('main')?.innerText?.substring(0, 2000) || '';
   }
 
-  // ─── Engagement actions ───────────────────────────────────────────────────
+  // ─── Like action ─────────────────────────────────────────────────────────────────
 
   async function doLike() {
     const sels = [
@@ -115,20 +130,16 @@
     for (const s of sels) {
       const btn = document.querySelector(s);
       if (!btn) continue;
-      const alreadyLiked =
-        btn.getAttribute('aria-pressed') === 'true' ||
-        btn.classList.contains('--active');
-      if (!alreadyLiked) {
-        btn.click();
-        await sleep(400 + rand(300));
-      }
+      const liked = btn.getAttribute('aria-pressed') === 'true' || btn.classList.contains('--active');
+      if (!liked) { btn.click(); await sleep(400 + rand(300)); }
       return true;
     }
     return false;
   }
 
+  // ─── Comment action ────────────────────────────────────────────────────────────
+
   async function doComment(text) {
-    // Open the comment editor
     const openSels = [
       'button[aria-label*="comment" i]',
       'button.comment-button',
@@ -139,7 +150,6 @@
       if (btn) { btn.click(); await sleep(1000 + rand(500)); break; }
     }
 
-    // Find the contenteditable box
     const editorSels = [
       '.ql-editor[contenteditable="true"]',
       '.comments-comment-box__editor [contenteditable="true"]',
@@ -154,14 +164,12 @@
     document.execCommand('selectAll', false, null);
     document.execCommand('delete',    false, null);
 
-    // Type with human-like per-character delay
     for (const ch of text) {
       document.execCommand('insertText', false, ch);
       await sleep(30 + rand(70));
     }
     await sleep(600 + rand(600));
 
-    // Submit
     const submitSels = [
       '.comments-comment-box__submit-button:not([disabled])',
       'button[data-control-name="submit_comment"]',
@@ -170,14 +178,13 @@
       const btn = document.querySelector(s);
       if (btn) { btn.click(); await sleep(500); return true; }
     }
-    // Fallback: Ctrl+Enter
     editor.dispatchEvent(
       new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true, ctrlKey: true })
     );
     return true;
   }
 
-  // ─── In-page overlay (supervised mode) ───────────────────────────────────
+  // ─── In-page overlay ───────────────────────────────────────────────────────────
 
   function showOverlay({ comment, requestId }) {
     removeOverlay();
@@ -218,7 +225,7 @@
 
   function removeOverlay() { activeOverlay?.remove(); activeOverlay = null; }
 
-  // ─── Message handler ──────────────────────────────────────────────────────
+  // ─── Message handler ───────────────────────────────────────────────────────
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     switch (msg.type) {
@@ -248,15 +255,10 @@
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   function rand(n)   { return Math.floor(Math.random() * n); }
-  function esc(s)    {
+  function esc(s) {
     return String(s)
-      .replace(/&/g,  '&amp;').replace(/</g, '&lt;')
-      .replace(/>/g,  '&gt;').replace(/"/g,  '&quot;');
-  }
-  function hashEl(el) {
-    return btoa(unescape(encodeURIComponent(
-      el.textContent?.substring(0, 60) || String(Date.now())
-    ))).slice(0, 16);
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
   function waitForEl(selector, cb, maxWait = 15000) {
     const el = document.querySelector(selector);
