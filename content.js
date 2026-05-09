@@ -2,7 +2,6 @@
 (function () {
   'use strict';
 
-  // Use post URL (no query string) as the dedup key — more reliable than DOM ids
   const knownPostUrls = new Set();
   let activeOverlay   = null;
   const isNotifPage   = window.location.pathname.startsWith('/notifications');
@@ -20,54 +19,62 @@
   // ─── Notification page scanning ──────────────────────────────────────────────
 
   function startNotificationScanning() {
-    // Scan immediately
     scanNotifications();
-
-    // Poll every 2 s — LinkedIn is a SPA; DOM changes can be missed
     setInterval(scanNotifications, 2000);
 
-    // Also watch the DOM for dynamic content
+    // Watch the DOM for dynamically loaded notification cards
     const obs = new MutationObserver(scanNotifications);
     function attachObs() {
-      const root = document.querySelector(
-        '.scaffold-finite-scroll__content, main, [role="main"], body'
-      );
-      if (root) obs.observe(root, { childList: true, subtree: true });
+      // Use stable ARIA role — LinkedIn always includes role="main"
+      const root = document.querySelector('[role="main"]') || document.body;
+      obs.observe(root, { childList: true, subtree: true });
     }
     attachObs();
     setTimeout(attachObs, 1500);
-    setTimeout(attachObs, 4000);
+    setTimeout(attachObs, 5000);
   }
 
   function scanNotifications() {
-    // Cast a wide net: find every anchor that points to a LinkedIn post
-    const links = document.querySelectorAll(
-      'a[href*="/posts/"], a[href*="ugcPost"], a[href*="/feed/update/"], a[href*="urn%3Ali%3Aactivity"]'
-    );
+    // Root: prefer [role="main"], fall back to body
+    const root = document.querySelector('[role="main"]') || document.body;
 
-    links.forEach((link) => {
-      const rawUrl  = link.href || '';
-      const postKey = rawUrl.split('?')[0]; // strip query params for stable key
-      if (!postKey || knownPostUrls.has(postKey)) return;
+    // Grab EVERY anchor in the notifications area
+    const allLinks = root.querySelectorAll('a[href]');
 
-      // Walk up to find the notification card
-      const card = link.closest(
-        'li, article, [data-urn], .artdeco-list__item, .nt-card, section'
-      ) || link.parentElement;
+    allLinks.forEach((link) => {
+      const href = link.href || '';
 
-      const cardText = card?.innerText?.trim() || '';
+      // Accept any link that points to a LinkedIn post (direct or encoded)
+      const isPostLink =
+        href.includes('/posts/')          ||
+        href.includes('ugcPost')          ||
+        href.includes('/feed/update/')    ||
+        href.includes('urn%3Ali%3Aactivity') ||
+        href.includes('urn:li:activity');
 
-      // Must look like a "posted" notification (not a share button, ad, etc.)
-      if (!/post|shared|published|article/i.test(cardText)) return;
+      if (!isPostLink) return;
 
-      // Skip digest / news notifications
-      if (/daily rundown|weekly rundown|newsletter|linkedin news/i.test(cardText)) return;
+      const postKey = href.split('?')[0]; // strip tracking params
+      if (knownPostUrls.has(postKey)) return;
+
+      // Walk up to a notification card using stable ARIA roles or li
+      const card =
+        link.closest('[role="listitem"]') ||
+        link.closest('[role="article"]')  ||
+        link.closest('li')               ||
+        link.closest('[data-urn]')        ||
+        link.parentElement;
+
+      const cardText = (card || link).innerText?.trim() || '';
+
+      // Skip news digests and promoted posts
+      if (/daily rundown|weekly rundown|newsletter|promoted|advertisement/i.test(cardText)) return;
 
       knownPostUrls.add(postKey);
 
       chrome.runtime.sendMessage({
         type:      'NEW_POST_NOTIFICATION',
-        postUrl:   rawUrl,
+        postUrl:   href,
         notifText: cardText.substring(0, 800),
         notifId:   postKey,
       });
@@ -80,8 +87,11 @@
     let lastCount = 0;
 
     function checkBadge() {
+      // Use attribute selector — avoids hashed class names
       const badge = document.querySelector(
-        '.notification-badge__count, .nav-item__badge-count, [data-test-notification-count]'
+        '[aria-label*="notification" i] [aria-label], ' +
+        '.notification-badge__count, ' +
+        '.nav-item__badge-count'
       );
       const count = parseInt(
         (badge?.textContent?.trim() || '0').replace(/[^0-9]/g, ''), 10
@@ -92,46 +102,47 @@
       }
     }
 
-    waitForEl('header, #global-nav', (el) => {
-      new MutationObserver(checkBadge).observe(el, {
-        childList: true, subtree: true, characterData: true,
-      });
-      checkBadge();
+    // Watch header via role="navigation" — always stable
+    const target = document.querySelector('[role="navigation"], header') || document.body;
+    new MutationObserver(checkBadge).observe(target, {
+      childList: true, subtree: true, characterData: true,
     });
+    checkBadge();
+    setInterval(checkBadge, 5000); // poll as fallback
   }
 
-  // ─── Post content reader (called on the actual post page) ─────────────────
+  // ─── Post content reader ───────────────────────────────────────────────────────
 
   function getPostContent() {
-    const sels = [
-      '.feed-shared-update-v2__description .break-words span[dir]',
-      '.update-components-text .break-words span[dir]',
-      '.feed-shared-text span[dir]',
-      '.update-components-text span',
-      '.feed-shared-update-v2__description',
-      'article .break-words',
-    ];
-    for (const s of sels) {
-      const el = document.querySelector(s);
-      if (el?.innerText?.trim()) return el.innerText.trim().substring(0, 2000);
+    // Try known stable attribute patterns first
+    const byAttr = document.querySelector(
+      '[data-test-id*="post"] [dir], [aria-label*="post content" i]'
+    );
+    if (byAttr?.innerText?.trim()) return byAttr.innerText.trim().substring(0, 2000);
+
+    // Fall back to any span[dir] inside main (LinkedIn always sets dir on text spans)
+    const main = document.querySelector('[role="main"]');
+    if (main) {
+      const spans = main.querySelectorAll('span[dir="ltr"], span[dir="rtl"]');
+      const texts = Array.from(spans).map(s => s.innerText.trim()).filter(t => t.length > 30);
+      if (texts.length) return texts.slice(0, 5).join(' ').substring(0, 2000);
+      return main.innerText.substring(0, 2000);
     }
-    return document.querySelector('main')?.innerText?.substring(0, 2000) || '';
+    return '';
   }
 
   // ─── Like action ─────────────────────────────────────────────────────────────────
 
   async function doLike() {
-    const sels = [
-      'button.react-button__trigger[aria-label*="Like"]',
-      '.reactions-react-button button',
-      'button[aria-label="Like"]',
-      'button[data-control-name="like_toggle"]',
-    ];
-    for (const s of sels) {
-      const btn = document.querySelector(s);
-      if (!btn) continue;
-      const liked = btn.getAttribute('aria-pressed') === 'true' || btn.classList.contains('--active');
-      if (!liked) { btn.click(); await sleep(400 + rand(300)); }
+    // aria-label is stable — LinkedIn has to keep it for accessibility
+    const btn = document.querySelector(
+      'button[aria-label*="Like"][aria-pressed="false"], ' +
+      'button[aria-label="Like"], ' +
+      'button[aria-label*="React"]'
+    );
+    if (btn) {
+      btn.click();
+      await sleep(400 + rand(300));
       return true;
     }
     return false;
@@ -140,23 +151,19 @@
   // ─── Comment action ────────────────────────────────────────────────────────────
 
   async function doComment(text) {
-    const openSels = [
-      'button[aria-label*="comment" i]',
-      'button.comment-button',
-      '[data-control-name="comment"]',
-    ];
-    for (const s of openSels) {
-      const btn = document.querySelector(s);
-      if (btn) { btn.click(); await sleep(1000 + rand(500)); break; }
-    }
+    // Open comment box via aria-label (stable)
+    const openBtn = document.querySelector(
+      'button[aria-label*="comment" i], button[aria-label*="Comment" i]'
+    );
+    if (openBtn) { openBtn.click(); await sleep(1000 + rand(500)); }
 
-    const editorSels = [
-      '.ql-editor[contenteditable="true"]',
-      '.comments-comment-box__editor [contenteditable="true"]',
-      '[data-placeholder*="comment" i][contenteditable="true"]',
-    ];
-    let editor = null;
-    for (const s of editorSels) { editor = document.querySelector(s); if (editor) break; }
+    // contenteditable is a standard HTML attribute — always stable
+    const editor = document.querySelector(
+      '[contenteditable="true"][aria-label*="comment" i], ' +
+      '[contenteditable="true"][aria-placeholder*="comment" i], ' +
+      '.ql-editor[contenteditable="true"], ' +
+      '[contenteditable="true"]'
+    );
     if (!editor) return false;
 
     editor.focus();
@@ -170,14 +177,15 @@
     }
     await sleep(600 + rand(600));
 
-    const submitSels = [
-      '.comments-comment-box__submit-button:not([disabled])',
-      'button[data-control-name="submit_comment"]',
-    ];
-    for (const s of submitSels) {
-      const btn = document.querySelector(s);
-      if (btn) { btn.click(); await sleep(500); return true; }
-    }
+    // Submit via aria-label
+    const submitBtn = document.querySelector(
+      'button[aria-label*="submit" i]:not([disabled]), ' +
+      'button[aria-label*="post comment" i]:not([disabled]), ' +
+      'button[type="submit"]:not([disabled])'
+    );
+    if (submitBtn) { submitBtn.click(); await sleep(500); return true; }
+
+    // Fallback: Ctrl+Enter
     editor.dispatchEvent(
       new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true, ctrlKey: true })
     );
@@ -259,17 +267,6 @@
     return String(s)
       .replace(/&/g,'&amp;').replace(/</g,'&lt;')
       .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-  }
-  function waitForEl(selector, cb, maxWait = 15000) {
-    const el = document.querySelector(selector);
-    if (el) { cb(el); return; }
-    const start = Date.now();
-    const obs = new MutationObserver(() => {
-      const found = document.querySelector(selector);
-      if (found) { obs.disconnect(); cb(found); }
-      else if (Date.now() - start > maxWait) obs.disconnect();
-    });
-    obs.observe(document.body, { childList: true, subtree: true });
   }
 
   init();
