@@ -24,11 +24,10 @@
   function startNotificationScanning() {
     scanNotifications();
     setInterval(scanNotifications, 2000);
-
     const obs = new MutationObserver(() => scanNotifications());
     function attachObs() {
       const root = document.querySelector('[role="main"]') || document.body;
-      LOG('Attaching MutationObserver to', root.tagName, root.getAttribute('role') || '');
+      LOG('MutationObserver attached to', root.tagName, root.className.substring(0, 40));
       obs.observe(root, { childList: true, subtree: true });
     }
     attachObs();
@@ -37,30 +36,20 @@
 
   function scanNotifications() {
     const root = document.querySelector('[role="main"]') || document.body;
-
-    // Collect candidate URLs from multiple attribute sources
     const candidates = [];
 
-    // 1. Standard <a href> tags
-    root.querySelectorAll('a[href]').forEach(a => {
-      candidates.push({ url: a.href, el: a });
-    });
-
-    // 2. Elements with data-href (LinkedIn sometimes uses this)
+    root.querySelectorAll('a[href]').forEach(a => candidates.push({ url: a.href, el: a }));
     root.querySelectorAll('[data-href]').forEach(el => {
-      const url = el.dataset.href;
-      if (url) candidates.push({ url, el });
+      if (el.dataset.href) candidates.push({ url: el.dataset.href, el });
     });
 
-    // Log all post-like URLs found (helps diagnose)
     const postCandidates = candidates.filter(c => isPostUrl(c.url));
+
     if (postCandidates.length > 0) {
-      LOG('Found', postCandidates.length, 'post link(s) on page:',
-        postCandidates.map(c => c.url.substring(0, 80)));
+      LOG('Found', postCandidates.length, 'post link(s):', postCandidates.map(c => c.url.substring(0, 80)));
     } else {
-      // Log ALL hrefs so we can see what's actually there
-      const allHrefs = candidates.map(c => c.url).filter(u => u && !u.startsWith('javascript'));
-      LOG('No post links found. All hrefs on page:', allHrefs.slice(0, 20));
+      const sample = candidates.slice(0, 15).map(c => c.url);
+      LOG('No post links found yet. Sample hrefs:', sample);
     }
 
     postCandidates.forEach(({ url, el }) => {
@@ -75,14 +64,10 @@
         el.parentElement;
 
       const cardText = (card || el).innerText?.trim() || '';
-
-      if (/daily rundown|weekly rundown|newsletter|promoted|advertisement/i.test(cardText)) {
-        LOG('Skipping digest/promo notification');
-        return;
-      }
+      if (/daily rundown|weekly rundown|newsletter|promoted|advertisement/i.test(cardText)) return;
 
       knownPostUrls.add(postKey);
-      LOG('Sending notification to background:', postKey);
+      LOG('Dispatching notification for:', postKey);
 
       chrome.runtime.sendMessage({
         type:      'NEW_POST_NOTIFICATION',
@@ -96,32 +81,42 @@
   function isPostUrl(url) {
     if (!url) return false;
     return (
-      url.includes('/posts/')           ||
-      url.includes('ugcPost')           ||
-      url.includes('/feed/update/')     ||
+      url.includes('/posts/')              ||
+      url.includes('ugcPost')              ||
+      url.includes('/feed/update/')        ||
       url.includes('urn%3Ali%3Aactivity') ||
       url.includes('urn:li:activity')
     );
   }
 
-  // ─── Bell badge watcher (non-notification pages) ───────────────────────────
+  // ─── Bell badge watcher ───────────────────────────────────────────────────────
 
   function watchBellBadge() {
-    let lastCount = 0;
+    let wasVisible = false;
+
     function checkBadge() {
+      // From DOM inspection: LinkedIn uses .notification-badge--show when there are unread notifs
       const badge = document.querySelector(
-        '.notification-badge__count, .nav-item__badge-count, [data-test-notification-count]'
+        '.notification-badge--show, ' +
+        '.notification-badge[class*="show"], ' +
+        '.artdeco-notification-badge'
       );
-      const count = parseInt((badge?.textContent?.trim() || '0').replace(/[^0-9]/g, ''), 10);
-      if (count > 0 && count !== lastCount) {
-        lastCount = count;
-        LOG('Bell badge changed to', count, '— opening background scan tab');
-        chrome.runtime.sendMessage({ type: 'BELL_BADGE_CHANGED', count });
+      const isVisible = !!badge;
+      const countText = badge?.textContent?.trim() || '';
+
+      if (isVisible && !wasVisible) {
+        wasVisible = true;
+        LOG('Bell badge appeared (count:', countText, ') — opening background scan');
+        chrome.runtime.sendMessage({ type: 'BELL_BADGE_CHANGED', count: parseInt(countText, 10) || 1 });
+      } else if (!isVisible) {
+        wasVisible = false;
       }
     }
-    const target = document.querySelector('[role="navigation"], header') || document.body;
-    new MutationObserver(checkBadge).observe(target, { childList: true, subtree: true, characterData: true });
-    setInterval(checkBadge, 5000);
+
+    // Watch the nav element — global-nav__primary-link-notif is a stable LinkedIn class
+    const nav = document.querySelector('.global-nav__primary-link-notif, [role="navigation"], header') || document.body;
+    new MutationObserver(checkBadge).observe(nav, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+    setInterval(checkBadge, 4000);
     checkBadge();
   }
 
@@ -157,8 +152,7 @@
     const editor = document.querySelector(
       '[contenteditable="true"][aria-label*="comment" i], ' +
       '[contenteditable="true"][aria-placeholder*="comment" i], ' +
-      '.ql-editor[contenteditable="true"], ' +
-      '[contenteditable="true"]'
+      '.ql-editor[contenteditable="true"], [contenteditable="true"]'
     );
     if (!editor) return false;
 
@@ -222,31 +216,16 @@
 
   function removeOverlay() { activeOverlay?.remove(); activeOverlay = null; }
 
-  // ─── Message handler ───────────────────────────────────────────────────────
-
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     switch (msg.type) {
-      case 'GET_POST_CONTENT':
-        sendResponse({ content: getPostContent() });
-        break;
-      case 'SHOW_OVERLAY':
-        showOverlay(msg); sendResponse({ ok: true });
-        break;
+      case 'GET_POST_CONTENT': sendResponse({ content: getPostContent() }); break;
+      case 'SHOW_OVERLAY':     showOverlay(msg); sendResponse({ ok: true }); break;
       case 'DO_ENGAGE':
-        (async () => {
-          await doLike();
-          await sleep(700 + rand(500));
-          await doComment(msg.comment);
-          sendResponse({ ok: true });
-        })();
+        (async () => { await doLike(); await sleep(700 + rand(500)); await doComment(msg.comment); sendResponse({ ok: true }); })();
         return true;
-      case 'REMOVE_OVERLAY':
-        removeOverlay(); sendResponse({ ok: true });
-        break;
+      case 'REMOVE_OVERLAY': removeOverlay(); sendResponse({ ok: true }); break;
     }
   });
-
-  // ─── Helpers ──────────────────────────────────────────────────────────────
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   function rand(n)   { return Math.floor(Math.random() * n); }
